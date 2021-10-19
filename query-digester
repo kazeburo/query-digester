@@ -1,0 +1,111 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use IO::Handle;
+use Getopt::Long;
+use File::Spec;
+
+sub find_path {
+    my $pg = shift;
+    my $path;
+    for ( split /:/, $ENV{PATH} ) {
+        if ( -x "$_/$pg" ) {
+            $path = "$_/$pg";
+            last;
+        }
+    }
+    $path;
+}
+
+my $limit = 40;
+my $duration = 10;
+Getopt::Long::Configure ("no_ignore_case");
+GetOptions(
+    "duration=s" => \$duration,
+    "clear-log" => \my $clear_log,
+    "stdout" => \my $stdout,
+    "limit=s" => \$limit,
+    "h|help" => \my $help,
+);
+my @mysqlopt = @ARGV;
+$|=1;
+
+die "duration does not seems numeric" unless $duration =~ m!^\d+$!;
+$duration += 0;
+
+my $pt_query_digest = find_path('pt-query-digest')
+    or die "could not find pt-query-digest";
+my $mysql = find_path('mysql')
+    or die "could not find mysql";
+my $tmpdir = "/tmp";#File::Spec->tmpdir();
+
+my $before = <<'EOF';
+SET @cur_long_query_time = @@long_query_time;
+SET @cur_slow_query_log_file = @@slow_query_log_file;
+SET @cur_slow_query_log = @@slow_query_log;
+SET GLOBAL slow_query_log_file = "<TMP_DIR>/slow_query_<DATE>.log";
+SET GLOBAL long_query_time = 0;
+SET GLOBAL slow_query_log = 1;
+EOF
+
+my $after = <<'EOF';
+SET GLOBAL long_query_time = @cur_long_query_time;
+SET GLOBAL slow_query_log_file = @cur_slow_query_log_file;
+SET GLOBAL slow_query_log = @cur_slow_query_log;
+EOF
+
+$before =~ s!<TMP_DIR>!$tmpdir!;
+my @lt = localtime();
+my $date = sprintf('%04d%02d%02d%02d%02d%02d',$lt[5]+1900,$lt[4],$lt[3],$lt[2],$lt[1],$lt[0]);
+$before =~ s!<DATE>!$date!;
+
+print STDERR "exec mysql to change long_query_time and slow_query_log_file\n";
+print STDERR "save slowlog to $tmpdir/slow_query_$date.log\n";
+
+#open(my $fh, ">", "$tmpdir/slow_query_$date.log");
+#close($fh);
+#chmod 0666, "$tmpdir/slow_query_$date.log";
+my $pid = fork;
+if ( defined $pid && $pid == 0 ) {
+    my $stop = 0;
+    local $SIG{INT} = sub {
+        $stop++;
+    };
+    local $SIG{TERM} = sub {
+        $stop++;
+    };
+
+    open(STDOUT,'>/dev/null');
+    open(my $pipe, '|-', $mysql, @mysqlopt, '--sigint-ignore');
+    $pipe->autoflush;
+    $pipe->print($before);
+    for my $i ( 0..$duration ) {
+        last if $stop;
+        $pipe->print("SELECT 1;\n") if $i % 7 == 0;
+        sleep 1;
+    }
+    $pipe->print($after);
+    exit;
+}
+print STDERR "wait $duration seconds\n";
+while (wait == -1) {}
+my $exit_code = $?;
+if ( $exit_code != 0 ) {
+    die sprintf("Error: mysql exited with code: %d", $exit_code >> 8);
+}
+
+print STDERR "finished capturing slowlog.\n";
+print STDERR "start query-digest\n";
+my $digest = *STDOUT;
+if ( !$stdout ) {
+    open($digest, '>', "$tmpdir/slow_query_$date.digest");
+}
+open(my $pipe, '-|', $pt_query_digest, '--limit',$limit,"$tmpdir/slow_query_$date.log");
+while(<$pipe>){
+    $digest->print($_);
+}
+print STDERR "finished pt-query-digest.\n";
+print STDERR "digest saved to $tmpdir/slow_query_$date.digest\n" if !$stdout;
+unlink "$tmpdir/slow_query_$date.log" if $clear_log;
+
